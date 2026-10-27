@@ -3,122 +3,223 @@ import mysql.connector
 import pandas as pd
 import plotly.express as px
 
-# ---------------------------------------------------------
-# 1. Cấu hình Trang Web
-# ---------------------------------------------------------
+# 1. Cấu hình trang
 st.set_page_config(
-    page_title="Dashboard Bán Hàng Realtime",
+    page_title="Dashboard Bán Hàng E-Commerce",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
-# ---------------------------------------------------------
-# 2. Tạo kết nối CSDL & Caching dữ liệu
-# ---------------------------------------------------------
-# Sử dụng @st.cache_resource để giữ kết nối CSDL không bị khởi tạo lại mỗi lần tương tác
-@st.cache_resource
-def init_connection():
-    return mysql.connector.connect(
-        host=st.secrets["mysql"]["host"],
-        port=st.secrets["mysql"]["port"],
-        database=st.secrets["mysql"]["database"],
-        user=st.secrets["mysql"]["username"],
-        password=st.secrets["mysql"]["password"]
-    )
+MONEY_UNIT = "USD"
+CACHE_TTL = 60  
 
-conn = init_connection()
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    connection = None
+    cursor = None
+    try:
+        cfg = st.secrets["mysql"]
+        connection = mysql.connector.connect(
+            host=cfg["host"],
+            port=int(cfg["port"]),
+            database=cfg["database"],
+            user=cfg["username"],
+            password=cfg["password"],
+            connection_timeout=10,
+        )
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(sql, params)
+        columns = cursor.column_names
+        rows = cursor.fetchall()
+        return pd.DataFrame(rows, columns=columns)
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None and connection.is_connected():
+            connection.close()
 
-# Sử dụng @st.cache_data với ttl (Time To Live) để lưu kết quả truy vấn trong 10 phút
-@st.cache_data(ttl=600)
-def run_query(query, params=None):
-    with conn.cursor(dictionary=True) as cursor:
-        cursor.execute(query, params or ())
-        result = cursor.fetchall()
-    return pd.DataFrame(result)
 
-# ---------------------------------------------------------
-# 3. Giao diện Sidebar - Các Bộ Lọc (Filters)
-# ---------------------------------------------------------
-st.sidebar.header("🔍 Bộ Lọc Dữ Liệu")
+st.title("📊 Báo Cáo Doanh Thu Bán Hàng (E-Commerce)")
+st.caption("Bài 17 · MySQL + Pandas + Plotly + Streamlit")
 
-# Lấy danh sách danh mục sản phẩm từ CSDL để làm Dropdown
+st.sidebar.header("🔍 Bộ lọc dữ liệu")
+if st.sidebar.button("🔄 Làm mới dữ liệu"):
+    run_query.clear()
+    st.rerun()
+
 try:
-    categories_df = run_query("SELECT category_name FROM Categories")
-    category_list = ["Tất cả"] + categories_df['category_name'].tolist()
-except Exception as e:
-    st.error(f"Không thể kết nối CSDL: {e}")
+    categories_df = run_query(
+        "SELECT DISTINCT category_name FROM Categories "
+        "WHERE category_name IS NOT NULL ORDER BY category_name"
+    )
+    cities_df = run_query(
+        "SELECT DISTINCT city FROM Customers "
+        "WHERE city IS NOT NULL ORDER BY city"
+    )
+    statuses_df = run_query(
+        "SELECT DISTINCT status FROM Orders "
+        "WHERE status IS NOT NULL ORDER BY status"
+    )
+    bounds_df = run_query(
+        "SELECT MIN(DATE(order_date)) AS min_date, "
+        "MAX(DATE(order_date)) AS max_date FROM Orders"
+    )
+except Exception as exc:
+    st.error(f"Không thể lấy bộ lọc từ MySQL: {exc}")
+    st.info("Kiểm tra file .streamlit/secrets.toml và tên bảng/cột trong phpMyAdmin.")
     st.stop()
 
-selected_category = st.sidebar.selectbox("Chọn Danh mục Sản phẩm:", category_list)
+if bounds_df.empty or pd.isna(bounds_df.at[0, "min_date"]):
+    st.warning("Bảng Orders chưa có đơn hàng nên chưa thể hiển thị Dashboard.")
+    st.stop()
 
-# ---------------------------------------------------------
-# 4. Truy vấn Dữ liệu theo Bộ Lọc & Hiển thị
-# ---------------------------------------------------------
-st.title("📊 Báo Cáo Doanh Thu Bán Hàng (E-Commerce)")
+min_date = pd.to_datetime(bounds_df.at[0, "min_date"]).date()
+max_date = pd.to_datetime(bounds_df.at[0, "max_date"]).date()
 
-# Xây dựng câu lệnh SQL linh hoạt dựa theo Filter
-base_sql = """
-    SELECT 
+start_date = st.sidebar.date_input(
+    "Từ ngày", value=min_date, min_value=min_date, max_value=max_date
+)
+end_date = st.sidebar.date_input(
+    "Đến ngày", value=max_date, min_value=min_date, max_value=max_date
+)
+
+if start_date > end_date:
+    st.error("Ngày bắt đầu không được lớn hơn ngày kết thúc.")
+    st.stop()
+
+status_options = statuses_df["status"].dropna().astype(str).tolist()
+status_default = ["Completed"] if "Completed" in status_options else status_options
+selected_statuses = st.sidebar.multiselect(
+    "Trạng thái đơn hàng", status_options, default=status_default
+)
+
+category_options = ["Tất cả"] + categories_df["category_name"].dropna().astype(str).tolist()
+selected_category = st.sidebar.selectbox("Danh mục sản phẩm", category_options)
+
+city_options = ["Tất cả"] + cities_df["city"].dropna().astype(str).tolist()
+selected_city = st.sidebar.selectbox("Thành phố", city_options)
+
+if not selected_statuses:
+    st.warning("Hãy chọn ít nhất một trạng thái đơn hàng ở thanh bên trái.")
+    st.stop()
+
+placeholders = ", ".join(["%s"] * len(selected_statuses))
+sql = f"""
+    SELECT
         o.order_id,
         o.order_date,
         o.status,
+        cu.city,
         c.category_name,
         p.product_name,
         od.quantity,
+        od.unit_price,
         (od.quantity * od.unit_price) AS total_price
-    FROM Orders o
-    JOIN OrderDetails od ON o.order_id = od.order_id
-    JOIN Products p ON od.product_id = p.product_id
-    JOIN Categories c ON p.category_id = c.category_id
-    WHERE o.status = 'Completed'
+    FROM Orders AS o
+    INNER JOIN Customers AS cu ON o.customer_id = cu.customer_id
+    INNER JOIN OrderDetails AS od ON o.order_id = od.order_id
+    INNER JOIN Products AS p ON od.product_id = p.product_id
+    INNER JOIN Categories AS c ON p.category_id = c.category_id
+    WHERE o.order_date >= %s
+      AND o.order_date < DATE_ADD(%s, INTERVAL 1 DAY)
+      AND o.status IN ({placeholders})
 """
+params = [start_date, end_date, *selected_statuses]
 
 if selected_category != "Tất cả":
-    base_sql += " AND c.category_name = %s"
-    df = run_query(base_sql, (selected_category,))
-else:
-    df = run_query(base_sql)
+    sql += " AND c.category_name = %s"
+    params.append(selected_category)
+if selected_city != "Tất cả":
+    sql += " AND cu.city = %s"
+    params.append(selected_city)
+sql += " ORDER BY o.order_date DESC, o.order_id DESC"
 
-# ---------------------------------------------------------
-# 5. Hiển thị Các Chỉ Số Quan Trọng (KPI Metrics)
-# ---------------------------------------------------------
-if not df.empty:
-    col1, col2, col3 = st.columns(3)
-    
-    total_revenue = df['total_price'].sum()
-    total_orders = df['order_id'].nunique()
-    avg_order_value = total_revenue / total_orders if total_orders > 0 else 0
+try:
+    df = run_query(sql, tuple(params))
+except Exception as exc:
+    st.error(f"Truy vấn dữ liệu thất bại: {exc}")
+    st.info("Kiểm tra đặc biệt các cột Customers.city, Orders.customer_id, OrderDetails.unit_price.")
+    st.stop()
 
-    col1.metric("Tổng Doanh Thu", f"{total_revenue:,.0f} USD")
-    col2.metric("Tổng Số Đơn Hàng", f"{total_orders} đơn")
-    col3.metric("Giá Trị Trung Bình/Đơn", f"{avg_order_value:,.2f} USD")
+if df.empty:
+    st.warning("Không tìm thấy chi tiết đơn hàng phù hợp với bộ lọc đang chọn.")
+    st.stop()
 
-    st.markdown("---")
+df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
 
-    # ---------------------------------------------------------
-    # 6. Biểu đồ Trực quan hóa (Plotly Chart)
-    # ---------------------------------------------------------
-    col_chart1, col_chart2 = st.columns(2)
+completed = df[df["status"].astype(str).str.casefold() == "completed"].copy()
+revenue = float(completed["total_price"].sum())
+order_count = int(df["order_id"].nunique())
+completed_orders = int(completed["order_id"].nunique())
+aov = revenue / completed_orders if completed_orders else 0
+units_sold = int(completed["quantity"].sum())
 
-    with col_chart1:
-        st.subheader("Doanh Thu Theo Ngày")
-        df_daily = df.groupby('order_date')['total_price'].sum().reset_index()
-        fig_line = px.line(df_daily, x='order_date', y='total_price', markers=True,
-                           labels={'order_date': 'Ngày', 'total_price': 'Doanh Thu ($)'})
-        st.plotly_chart(fig_line, use_container_width=True)
 
-    with col_chart2:
-        st.subheader("Top Sản Phẩm Bán Chạy")
-        df_product = df.groupby('product_name')['quantity'].sum().reset_index()
-        fig_bar = px.bar(df_product, x='quantity', y='product_name', orientation='h',
-                         labels={'quantity': 'Số Lượng', 'product_name': 'Sản Phẩm'})
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("💰 Tổng doanh thu", f"{revenue:,.2f} {MONEY_UNIT}")
+k2.metric("🧾 Số đơn hàng", f"{order_count:,}")
+k3.metric("📈 AOV / đơn hoàn thành", f"{aov:,.2f} {MONEY_UNIT}")
+k4.metric("📦 Sản phẩm đã bán", f"{units_sold:,}")
+st.caption("Doanh thu, AOV và số sản phẩm chỉ tính đơn Completed. "
+           "Số đơn hàng đếm các trạng thái đang lọc.")
+
+st.divider()
+
+
+left_chart, right_chart = st.columns(2)
+with left_chart:
+    st.subheader("📈 Doanh thu theo ngày")
+    if not completed.empty:
+        completed["ngay"] = completed["order_date"].dt.date
+        daily = (
+            completed.dropna(subset=["ngay"])
+            .groupby("ngay", as_index=False)["total_price"].sum()
+            .sort_values("ngay")
+        )
+        if not daily.empty:
+            fig_line = px.line(
+                daily, x="ngay", y="total_price", markers=True,
+                labels={"ngay": "Ngày đặt hàng", "total_price": f"Doanh thu ({MONEY_UNIT})"},
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+        else:
+            st.info("Không có ngày hợp lệ để vẽ biểu đồ.")
+    else:
+        st.info("Không có đơn Completed trong bộ lọc.")
+
+with right_chart:
+    st.subheader("🏆 Top 5 sản phẩm bán chạy")
+    if not completed.empty:
+        top5 = (
+            completed.groupby("product_name", as_index=False)["quantity"].sum()
+            .nlargest(5, "quantity")
+            .sort_values("quantity", ascending=True)
+        )
+        fig_bar = px.bar(
+            top5, x="quantity", y="product_name", orientation="h",
+            labels={"quantity": "Số lượng", "product_name": "Sản phẩm"},
+            text="quantity",
+        )
         st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.info("Không có sản phẩm thuộc đơn Completed để xếp hạng.")
 
-    # ---------------------------------------------------------
-    # 7. Bảng Dữ liệu Chi tiết
-    # ---------------------------------------------------------
-    with st.expander("📄 Xem Bảng Dữ Liệu Chi Tiết"):
-        st.dataframe(df, use_container_width=True)
-else:
-    st.warning("Không tìm thấy dữ liệu phù hợp với bộ lọc!")
 
+st.subheader("📄 Bảng dữ liệu chi tiết")
+visible_columns = [
+    "order_id", "order_date", "status", "city", "category_name",
+    "product_name", "quantity", "unit_price", "total_price",
+]
+table_df = df[visible_columns].copy()
+st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+csv_bytes = table_df.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    label="⬇️ Tải dữ liệu đã lọc (CSV)",
+    data=csv_bytes,
+    file_name="bao_cao_ecommerce_bai17.csv",
+    mime="text/csv",
+)
+st.caption("CSV xuất các dòng theo bộ lọc hiện tại, bao gồm cả trạng thái không Completed nếu được chọn.")
